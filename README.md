@@ -1,6 +1,9 @@
 # claude-cad
 
 Servidor MCP que conecta Claude con AutoCAD vía COM/ActiveX.
+Diseñado para que Claude entienda pedidos en lenguaje natural, identifique el
+dibujo, edite textos con precisión y compute superficies.
+
 Funciona en **Windows** con AutoCAD instalado.
 
 ---
@@ -8,10 +11,8 @@ Funciona en **Windows** con AutoCAD instalado.
 ## Requisitos
 
 - Windows 10/11
-- AutoCAD (cualquier versión moderna con COM habilitado)
+- AutoCAD (con COM/ActiveX habilitado — viene por defecto)
 - Python 3.10+
-
----
 
 ## Instalación
 
@@ -21,92 +22,138 @@ cd claude-cad
 pip install -r requirements.txt
 ```
 
----
-
 ## Configurar Claude Code
 
-Agregá el servidor en tu configuración de Claude Code.
-El archivo se encuentra en `%APPDATA%\Claude\claude_desktop_config.json`
-(o `~/.claude.json` si usás la CLI):
+Edita `%APPDATA%\Claude\claude_desktop_config.json` (o `~/.claude.json`):
 
 ```json
 {
   "mcpServers": {
     "autocad": {
       "command": "python",
-      "args": ["C:\\ruta\\a\\claude-cad\\server.py"],
-      "description": "Controla AutoCAD desde Claude"
+      "args": ["C:\\ruta\\a\\claude-cad\\server.py"]
     }
   }
 }
 ```
 
-Reemplazá `C:\\ruta\\a\\claude-cad\\server.py` con la ruta real donde clonaste el repo.
-
----
-
 ## Uso
 
-1. Abrí AutoCAD con un dibujo cargado.
-2. Iniciá Claude Code (CLI o app de escritorio).
-3. Claude tendrá acceso a las herramientas de AutoCAD automáticamente.
+1. Abrí AutoCAD con un dibujo.
+2. Iniciá Claude Code.
+3. Claude tendrá los tools y los prompts disponibles.
 
-Ejemplos de lo que podés pedirle a Claude:
+Ejemplos de pedidos que Claude puede manejar:
 
-- *"Creá una línea desde (0,0) hasta (100,50)"*
-- *"Listá todas las entidades en la capa MUROS"*
-- *"Creá un círculo de radio 25 centrado en (50,50)"*
-- *"Mové la entidad con handle 3A5 10 unidades hacia la derecha"*
-- *"Guardá el dibujo"*
+- *"¿Qué hay en este dibujo? Resumime por capas."*
+- *"En todos los textos que digan 'OFICINA' cambialos por 'DESPACHO'."*
+- *"Computame las superficies de la capa LOSAS y dame el total en m²."*
+- *"Hacé click en el ambiente principal y decime cuánto mide."* (después
+  podés indicarle un punto interior)
+- *"Creá los muros del perímetro: 10×6 m en la capa MUROS, color rojo."*
+- *"Cambiale la altura a todos los textos de la capa ROTULO a 5."*
 
 ---
 
-## Herramientas disponibles
+## Cómo interpreta los pedidos
+
+El servidor expone **prompts** (templates) que Claude usa automáticamente para
+descomponer pedidos comunes:
+
+| Prompt | Cuándo se usa |
+|---|---|
+| `autocad_context` | Guía general: identificar antes de modificar, respetar unidades, capas correctas |
+| `computar_superficies` | Para cómputos de áreas: ordena el flujo por capas / boundary / totales |
+| `editar_texto` | Para búsqueda y edición segura de textos con confirmación previa |
+
+---
+
+## Herramientas
 
 ### Estado y documentos
-| Herramienta | Descripción |
+| Tool | Descripción |
 |---|---|
-| `get_autocad_status` | Verifica si AutoCAD está corriendo |
-| `open_drawing` | Abre un archivo DWG |
-| `save_drawing` | Guarda el dibujo activo |
-| `close_drawing` | Cierra el dibujo |
-| `get_drawing_info` | Info del dibujo: nombre, unidades, límites |
+| `get_autocad_status` | Verifica AutoCAD y lista documentos abiertos |
+| `open_drawing` | Abre un DWG |
+| `save_drawing` | Guarda (o Save As) |
+| `close_drawing` | Cierra el dibujo activo |
+| `switch_drawing` | Cambia el dibujo activo por nombre |
+
+### Identificación y análisis
+| Tool | Descripción |
+|---|---|
+| `get_drawing_info` | Nombre, ruta, unidades, límites, extents, conteos |
+| `analyze_drawing` | Conteo por tipo y por capa, opcionalmente con handles |
+| `get_bounding_box` | BBox de una entidad o del dibujo entero |
+| `list_blocks` | Definiciones de bloque (excluye layouts) |
 
 ### Capas
-| Herramienta | Descripción |
+| Tool | Descripción |
 |---|---|
-| `list_layers` | Lista todas las capas |
-| `create_layer` | Crea una capa nueva |
+| `list_layers` | Lista con estado, color, linetype, lineweight |
+| `create_layer` | Crea una capa |
 | `set_active_layer` | Cambia la capa activa |
+| `set_layer_state` | On/frozen/locked |
 
 ### Crear geometría
-| Herramienta | Descripción |
+| Tool | Descripción |
 |---|---|
-| `create_line` | Línea entre dos puntos |
-| `create_circle` | Círculo por centro y radio |
-| `create_arc` | Arco por centro, radio y ángulos |
-| `create_rectangle` | Rectángulo por dos esquinas |
-| `create_polyline` | Polilínea 2D con N puntos |
-| `create_text` | Texto simple |
-| `create_mtext` | Texto multilínea |
-| `insert_block` | Insertar bloque existente |
+| `create_line`, `create_circle`, `create_arc` | Primitivas básicas |
+| `create_rectangle`, `create_polyline`, `create_ellipse` | Formas compuestas |
+| `insert_block` | Inserta un bloque existente |
 
-### Modificar entidades
-| Herramienta | Descripción |
+### Textos
+| Tool | Descripción |
 |---|---|
-| `list_entities` | Lista entidades (filtrable por capa) |
-| `get_entity_by_handle` | Detalle de una entidad por handle |
-| `move_entity` | Mueve por desplazamiento |
-| `scale_entity` | Escala respecto a punto base |
-| `rotate_entity` | Rota respecto a punto base |
-| `change_entity_layer` | Cambia la capa de una entidad |
-| `change_entity_color` | Cambia el color (número ACI) |
-| `delete_entity` | Elimina una entidad |
+| `create_text`, `create_mtext` | Crear texto y MText |
+| `list_all_texts` | Lista todos los textos (incluye atributos de bloques opcional) |
+| `find_texts_containing` | Búsqueda por subcadena |
+| `edit_text_by_handle` | Reemplaza el contenido de un texto |
+| `find_and_replace_text` | Buscar y reemplazar global con `dry_run` para previsualizar |
+| `set_text_properties` | Cambia altura, rotación, estilo, ancho, posición |
+| `list_text_styles` | Lista los estilos de texto del dibujo |
+
+### Modificación genérica
+| Tool | Descripción |
+|---|---|
+| `list_entities` | Filtrable por capa y/o tipo, devuelve detalles ricos |
+| `get_entity_by_handle` | Detalle completo |
+| `move_entity`, `copy_entity` | Mover y copiar |
+| `scale_entity`, `rotate_entity`, `mirror_entity`, `offset_entity` | Transformaciones |
+| `change_entity_layer`, `change_entity_color` | Cambios de propiedades |
+| `delete_entity`, `delete_entities` | Borrado individual y por lotes |
+
+### Cómputo de superficies
+| Tool | Descripción |
+|---|---|
+| `calculate_area_of_entity` | Área y perímetro de una entidad cerrada |
+| `sum_areas` | Suma de áreas de varios handles |
+| `calculate_area_by_layer` | Suma total por capa |
+| `calculate_areas_all_layers` | Resumen por capas con totales (ideal para informes) |
+| `calculate_boundary_area_at_point` | Construye boundary cerrado desde un punto interior y mide |
+| `create_region_from_polyline` | Convierte polilínea cerrada → Región |
+| `region_boolean` | Unión / Resta / Intersección de regiones |
+
+### Cotas
+| Tool | Descripción |
+|---|---|
+| `create_dimension_aligned` | Cota alineada |
+| `create_dimension_linear` | Cota lineal con rotación opcional |
 
 ### Vista y comandos
-| Herramienta | Descripción |
+| Tool | Descripción |
 |---|---|
-| `zoom_extents` | Zoom a todas las entidades |
-| `zoom_window` | Zoom a ventana rectangular |
-| `run_autocad_command` | Envía comando directo a AutoCAD |
-| `get_selection_set` | Obtiene entidades seleccionadas |
+| `zoom_extents`, `zoom_window`, `zoom_to_entity` | Navegación de vista |
+| `run_autocad_command` | Comando directo (usar como último recurso) |
+| `get_selection_set` | Selección interactiva del usuario en AutoCAD |
+
+---
+
+## Notas
+
+- Las áreas se devuelven en las unidades del dibujo elevadas al cuadrado.
+  Si tu dibujo está en mm, dividí por `1_000_000` para obtener m².
+- Los handles son identificadores estables: pedile a Claude que te los muestre
+  y los podés usar para deshacer manualmente o referenciar después.
+- `calculate_boundary_area_at_point` usa `-BOUNDARY` internamente: el punto
+  debe estar dentro de un área visualmente cerrada por líneas/polilíneas.
