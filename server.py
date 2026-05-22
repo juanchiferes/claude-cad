@@ -10,6 +10,8 @@ Capacidades:
 - Cálculos de superficie: por entidad, por capa, sumatorias, regiones
 - Identificación de boundaries cerrados y cómputos
 - Operaciones booleanas con regiones (unión, resta, intersección)
+- Layouts, viewports y escalas (paper space)
+- Exportar a PDF: un layout o todos los layouts en un solo archivo
 """
 
 import sys
@@ -2167,6 +2169,367 @@ def regen_drawing() -> dict:
     doc = _active_doc(acad)
     doc.Regen(1)
     return {"regenerated": True}
+
+
+# ============================================================================
+# Exportar a PDF
+# ============================================================================
+
+# Nombres de plotters PDF según versión / idioma de AutoCAD
+_PDF_PLOTTER_CANDIDATES = [
+    "DWG To PDF.pc3",
+    "AutoCAD PDF (General Documentation).pc3",
+    "AutoCAD PDF (High Quality Print).pc3",
+    "AutoCAD PDF (Smallest File).pc3",
+    "AutoCAD PDF (Web And Mobile).pc3",
+    "PDF",
+]
+
+
+def _find_pdf_plotter(doc) -> str:
+    """Devuelve el primer plotter PDF disponible en el sistema."""
+    try:
+        available = list(doc.GetPlotDeviceNames())
+        for candidate in _PDF_PLOTTER_CANDIDATES:
+            if candidate in available:
+                return candidate
+        for name in available:
+            if "pdf" in name.lower():
+                return name
+    except Exception:
+        pass
+    return "DWG To PDF.pc3"
+
+
+def _pdf_output_path(path: str) -> str:
+    return path if path.lower().endswith(".pdf") else path + ".pdf"
+
+
+@mcp.tool()
+def list_plotters() -> dict:
+    """
+    Lista los plotters/impresoras disponibles en AutoCAD y detecta
+    automáticamente cuál es el PDF recomendado.
+    """
+    acad = _get_acad()
+    doc = _active_doc(acad)
+    try:
+        available = list(doc.GetPlotDeviceNames())
+    except Exception:
+        available = []
+    pdf_plotter = _find_pdf_plotter(doc)
+    return {
+        "plotters": available,
+        "recommended_pdf_plotter": pdf_plotter,
+    }
+
+
+@mcp.tool()
+def list_paper_sizes(plotter: str = "") -> list[str]:
+    """
+    Lista los tamaños de papel disponibles para un plotter.
+
+    Args:
+        plotter: Nombre del plotter. Vacío = usa el PDF recomendado.
+    """
+    acad = _get_acad()
+    doc = _active_doc(acad)
+    if not plotter:
+        plotter = _find_pdf_plotter(doc)
+    try:
+        sizes = list(doc.GetPlotStyleModeList())
+    except Exception:
+        sizes = []
+    # Tamaño de papel real: usar RefreshPlotDeviceInfo
+    try:
+        doc.ActiveLayout.RefreshPlotDeviceInfo()
+        sizes = list(doc.ActiveLayout.GetPaperSizes())
+    except Exception:
+        pass
+    return sizes
+
+
+@mcp.tool()
+def configure_layout_plot(
+    layout: str,
+    plotter: str = "",
+    paper_size: str = "",
+    plot_area: str = "Layout",
+    center_plot: bool = True,
+    fit_to_paper: bool = False,
+    scale_numerator: float = 1.0,
+    scale_denominator: float = 1.0,
+    landscape: bool | None = None,
+) -> dict:
+    """
+    Configura los ajustes de impresión de un layout sin exportar todavía.
+    Útil para dejar el layout listo antes de exportar, o para ajustar
+    el papel desde Claude sin abrir el diálogo de Page Setup.
+
+    Args:
+        layout: Nombre del layout (ej: 'Layout1').
+        plotter: Nombre del plotter. Vacío = PDF detectado automáticamente.
+        paper_size: Nombre del tamaño (ej: 'ISO A3 (420.00 x 297.00 MM)').
+                    Vacío = no cambiar.
+        plot_area: 'Layout', 'Extents', 'Display', o 'Window'.
+        center_plot: True para centrar el dibujo en la hoja.
+        fit_to_paper: True para escalar al papel; False para usar
+                      scale_numerator:scale_denominator.
+        scale_numerator, scale_denominator: Escala de plot (ej: 1/100 → 1,100).
+        landscape: True=horizontal, False=vertical, None=no cambiar.
+    """
+    acad = _get_acad()
+    doc = _active_doc(acad)
+
+    # Buscar el layout
+    found = None
+    for l in doc.Layouts:
+        if l.Name.lower() == layout.lower():
+            found = l
+            break
+    if found is None:
+        raise RuntimeError(f"Layout '{layout}' no existe.")
+
+    # Activar para que RefreshPlotDeviceInfo funcione
+    doc.ActiveLayout = found
+
+    if not plotter:
+        plotter = _find_pdf_plotter(doc)
+
+    try:
+        found.ConfigName = plotter
+        found.RefreshPlotDeviceInfo()
+    except Exception as exc:
+        return {"layout": layout, "warning": f"No se pudo asignar el plotter: {exc}"}
+
+    if paper_size:
+        try:
+            found.CanonicalMediaName = paper_size
+        except Exception:
+            pass
+
+    # plot_area: 0=Display,1=Extents,2=Limits,3=View,4=Window,5=Layout
+    area_map = {
+        "display": 0, "extents": 1, "limits": 2,
+        "view": 3, "window": 4, "layout": 5
+    }
+    try:
+        found.PlotType = area_map.get(plot_area.lower(), 5)
+    except Exception:
+        pass
+
+    try:
+        found.CenterPlot = center_plot
+    except Exception:
+        pass
+
+    if fit_to_paper:
+        try:
+            found.StandardScale = 0  # 0 = Fit
+        except Exception:
+            pass
+    else:
+        try:
+            # -3 = custom scale
+            found.StandardScale = -3
+            found.SetCustomScale(scale_numerator, scale_denominator)
+        except Exception:
+            pass
+
+    if landscape is not None:
+        try:
+            # 0=portrait, 1=landscape
+            found.PlotRotation = 1 if landscape else 0
+        except Exception:
+            pass
+
+    return {
+        "layout": layout,
+        "plotter": plotter,
+        "paper_size": paper_size or "(sin cambio)",
+        "plot_area": plot_area,
+        "center_plot": center_plot,
+        "fit_to_paper": fit_to_paper,
+        "landscape": landscape,
+    }
+
+
+@mcp.tool()
+def plot_to_pdf(
+    output_path: str,
+    layout: str = "",
+    plotter: str = "",
+    all_layouts: bool = False,
+    exclude_model: bool = True,
+) -> dict:
+    """
+    Exporta a PDF. Tres modos:
+    - layout específico: indicar `layout`.
+    - layout activo: dejar `layout` vacío y `all_layouts=False`.
+    - todos los layouts en un solo PDF multi-hoja: `all_layouts=True`.
+
+    Args:
+        output_path: Ruta del PDF de salida (ej: C:\\proyectos\\plano.pdf).
+                     Se agrega .pdf si no lo tiene.
+        layout: Nombre del layout a exportar. Vacío = layout activo.
+        plotter: Nombre del plotter PDF. Vacío = se detecta automáticamente.
+        all_layouts: True para exportar todos los layouts en un PDF multi-hoja.
+        exclude_model: Si all_layouts=True, excluye el espacio Model del PDF.
+    """
+    acad = _get_acad()
+    doc = _active_doc(acad)
+    output_path = _pdf_output_path(output_path)
+
+    if not plotter:
+        plotter = _find_pdf_plotter(doc)
+
+    plot_obj = doc.Plot
+    plot_obj.NumberOfCopies = 1
+    plot_obj.PlotHidden = True
+    try:
+        plot_obj.QuietErrorMode = True
+    except Exception:
+        pass
+
+    # Construir la lista de layouts a plotear
+    if all_layouts:
+        to_plot = [
+            l.Name for l in doc.Layouts
+            if not (exclude_model and l.Name.lower() == "model")
+        ]
+        if not to_plot:
+            raise RuntimeError("No hay layouts (presentaciones) para exportar.")
+    elif layout:
+        # Verificar que existe
+        names = [l.Name for l in doc.Layouts]
+        match = next(
+            (n for n in names if n.lower() == layout.lower()), None
+        )
+        if match is None:
+            raise RuntimeError(
+                f"Layout '{layout}' no existe. Layouts disponibles: {names}"
+            )
+        doc.ActiveLayout = next(l for l in doc.Layouts if l.Name == match)
+        to_plot = [match]
+    else:
+        to_plot = [doc.ActiveLayout.Name]
+
+    # Asignar plotter a todos los layouts a exportar
+    for name in to_plot:
+        for l in doc.Layouts:
+            if l.Name == name:
+                try:
+                    if l.ConfigName != plotter:
+                        l.ConfigName = plotter
+                        l.RefreshPlotDeviceInfo()
+                except Exception:
+                    pass
+
+    try:
+        plot_obj.SetLayoutsToPlot(to_plot)
+    except Exception:
+        # Fallback para versiones que no aceptan lista directamente
+        pass
+
+    success = plot_obj.PlotToFile(output_path, plotter)
+
+    return {
+        "success": bool(success),
+        "output": output_path,
+        "layouts_exported": to_plot,
+        "plotter_used": plotter,
+        "sheets": len(to_plot),
+    }
+
+
+@mcp.tool()
+def batch_plot_to_pdf(
+    layouts_and_paths: list[dict],
+    plotter: str = "",
+) -> dict:
+    """
+    Exporta cada layout a su propio PDF por separado.
+    Útil cuando necesitás un archivo PDF por plano.
+
+    Args:
+        layouts_and_paths: Lista de {"layout": "Nombre", "output_path": "C:\\...\\plano.pdf"}
+        plotter: Nombre del plotter PDF. Vacío = se detecta automáticamente.
+    """
+    acad = _get_acad()
+    doc = _active_doc(acad)
+    if not plotter:
+        plotter = _find_pdf_plotter(doc)
+
+    results = []
+    for item in layouts_and_paths:
+        layout_name = item.get("layout", "")
+        out = _pdf_output_path(item.get("output_path", f"{layout_name}.pdf"))
+        try:
+            result = plot_to_pdf(
+                output_path=out,
+                layout=layout_name,
+                plotter=plotter,
+            )
+            results.append(result)
+        except Exception as exc:
+            results.append({
+                "success": False,
+                "layout": layout_name,
+                "output": out,
+                "error": str(exc),
+            })
+
+    ok = sum(1 for r in results if r.get("success"))
+    return {
+        "total": len(results),
+        "ok": ok,
+        "failed": len(results) - ok,
+        "details": results,
+    }
+
+
+# ============================================================================
+# Prompts — guías para tareas comunes
+# ============================================================================
+
+@mcp.prompt()
+def exportar_pdf(descripcion: str = "") -> str:
+    """Guía para exportar a PDF desde AutoCAD."""
+    return f"""El usuario quiere exportar a PDF: "{descripcion}".
+
+Procedé en este orden:
+
+1. **Verificar plotters disponibles**: `list_plotters()`.
+   Revisá `recommended_pdf_plotter` — ese es el plotter a usar.
+   Si la lista está vacía, avisale al usuario que necesita tener
+   instalado 'DWG To PDF.pc3' o un plotter PDF equivalente.
+
+2. **Identificar qué exportar**:
+   - Un layout específico → `plot_to_pdf(output_path, layout="NombreLayout", plotter=...)`
+   - El layout activo → `plot_to_pdf(output_path, plotter=...)`
+   - Todos los layouts en un PDF multi-hoja → `plot_to_pdf(output_path, all_layouts=True, plotter=...)`
+   - Un PDF por layout → `batch_plot_to_pdf([{layout, path}, ...], plotter=...)`
+
+3. **Configurar el layout antes si es necesario** (opcional):
+   Usá `configure_layout_plot` para fijar papel (A3, A4, etc.),
+   orientación, escala de plot y área. Solo es necesario si el layout
+   no fue configurado antes. Podés ver los tamaños disponibles
+   con `list_paper_sizes(plotter)`.
+
+4. **Confirmar el output_path**:
+   - Pedile al usuario la carpeta de destino si no la mencionó.
+   - Si mencionó "guardalo en el mismo lugar que el DWG", usá
+     `get_drawing_info()` para obtener el directorio del archivo.
+
+5. **Reportar el resultado**:
+   - Indicar ruta del PDF generado, layouts exportados, hojas.
+   - Si `success=False`, describir el error y sugerir:
+     a) Revisar que el plotter PDF esté instalado.
+     b) Verificar que la ruta de destino sea válida y tenga permisos.
+     c) Intentar con otro plotter de la lista.
+
+Regla de oro: nunca uses `run_autocad_command` para plotear —
+`plot_to_pdf` es más confiable y no abre diálogos."""
 
 
 # ============================================================================
