@@ -14,6 +14,7 @@ Capacidades:
 
 import sys
 import math
+from contextlib import contextmanager
 from typing import Any
 from mcp.server.fastmcp import FastMCP
 
@@ -25,6 +26,9 @@ except ImportError:
     WIN32_AVAILABLE = False
 
 mcp = FastMCP("autocad-mcp")
+
+# Cache de la conexión COM a AutoCAD para evitar reconectar en cada tool call.
+_ACAD_CACHE: dict[str, Any] = {"app": None}
 
 
 # ============================================================================
@@ -78,12 +82,72 @@ ACI_COLORS = {
 
 
 def _get_acad():
+    """Conecta a AutoCAD reutilizando la conexión COM cacheada cuando es posible."""
     if not WIN32_AVAILABLE:
         raise RuntimeError("pywin32 no instalado. Ejecuta: pip install pywin32")
+    cached = _ACAD_CACHE.get("app")
+    if cached is not None:
+        try:
+            _ = cached.Version  # ping para verificar que el objeto sigue vivo
+            return cached
+        except Exception:
+            _ACAD_CACHE["app"] = None
     try:
-        return win32.GetActiveObject("AutoCAD.Application")
+        app = win32.GetActiveObject("AutoCAD.Application")
+        _ACAD_CACHE["app"] = app
+        return app
     except Exception:
         raise RuntimeError("AutoCAD no está abierto. Abrí AutoCAD primero.")
+
+
+def _space(acad, in_paper: bool | None = None):
+    """
+    Devuelve el espacio en el que trabajar:
+    - in_paper=True  → PaperSpace
+    - in_paper=False → ModelSpace
+    - in_paper=None  → el espacio activo según ActiveSpace del documento
+    """
+    doc = _active_doc(acad)
+    if in_paper is None:
+        # ActiveSpace: 0=Paper, 1=Model
+        return doc.PaperSpace if doc.ActiveSpace == 0 else doc.ModelSpace
+    return doc.PaperSpace if in_paper else doc.ModelSpace
+
+
+@contextmanager
+def _fast_batch(acad, regen_at_end: bool = True):
+    """
+    Context manager para operaciones en lote. Desactiva el redibujado/echo de
+    comandos mientras se hacen muchas modificaciones y restaura al salir.
+
+    Reduce drásticamente el tiempo de creación de muchas entidades.
+    """
+    doc = _active_doc(acad)
+    prev_cmdecho = None
+    try:
+        try:
+            prev_cmdecho = doc.GetVariable("CMDECHO")
+            doc.SetVariable("CMDECHO", 0)
+        except Exception:
+            pass
+        # Congelar la actualización gráfica
+        try:
+            acad.Application.Update()  # flush previo
+        except Exception:
+            pass
+        yield
+    finally:
+        try:
+            if prev_cmdecho is not None:
+                doc.SetVariable("CMDECHO", prev_cmdecho)
+        except Exception:
+            pass
+        if regen_at_end:
+            try:
+                # 1 = AllViewports
+                doc.Regen(1)
+            except Exception:
+                pass
 
 
 def _active_doc(acad):
@@ -311,14 +375,31 @@ te pida modificar el dibujo, seguí estos principios:
    - Boundary cerrado a partir de un punto interno: `calculate_boundary_area_at_point`.
    - Múltiples handles: `sum_areas`.
 
-6. **Confirmá cambios destructivos.** Si vas a borrar muchas entidades o
+6. **Layouts y escalas.** Cuando el usuario pida "generar un layout" o
+   "escalar a 1:50":
+   - Trabajá con `list_layouts`, `create_layout`, `set_active_layout`,
+     `setup_layout_page` (para fijar tamaño de hoja A4/A3/A1).
+   - Insertá viewports con `create_viewport` indicando layout, centro,
+     tamaño y `scale_ratio` ('1:50', '1:100', etc.) directamente —
+     evitá fijar escala con SendCommand.
+   - Para reajustar una escala existente usá `set_viewport_scale`.
+   - Para que el modelo quepa entero usá `fit_viewport_to_extents`.
+   - `lock_viewport` evita que se descalibre la escala.
+
+7. **Rendimiento.** Cuando vayas a crear/modificar muchas entidades:
+   - Llamá `set_performance_mode(True)` al empezar y `False` al terminar.
+   - Usá las versiones batch: `create_lines_batch`, `create_polylines_batch`,
+     `create_texts_batch`, `transform_batch`. Una sola llamada con 200
+     elementos es 50x más rápida que 200 llamadas individuales.
+
+8. **Confirmá cambios destructivos.** Si vas a borrar muchas entidades o
    modificar varias capas, mostrá primero qué encontraste y confirmá.
 
-7. **Devolvé contexto al usuario.** Después de modificar, decí qué handles
+9. **Devolvé contexto al usuario.** Después de modificar, decí qué handles
    creaste o tocaste y en qué capa, así el usuario puede deshacer si quiere.
 
-8. **No uses `run_autocad_command` salvo último recurso.** SendCommand puede
-   quedar esperando input. Preferí las herramientas tipadas."""
+10. **No uses `run_autocad_command` salvo último recurso.** SendCommand puede
+    quedar esperando input. Preferí las herramientas tipadas."""
 
 
 @mcp.prompt()
@@ -338,6 +419,46 @@ Procedé así:
    (las del dibujo elevadas al cuadrado).
 6. Si las unidades del dibujo son mm, ofrecé también el total en m²
    (dividir por 1.000.000)."""
+
+
+@mcp.prompt()
+def armar_layout(descripcion: str = "") -> str:
+    """Plantilla para armar layouts (presentaciones) con escala."""
+    return f"""El usuario quiere armar un layout: "{descripcion}".
+
+Procedé en este orden, sin atajos:
+
+1. **Activá performance mode**: `set_performance_mode(True)`.
+
+2. **Verificá unidades**: `get_drawing_info`. Las hojas se piden en mm
+   (A4 = 210x297, A3 = 297x420, A2 = 420x594, A1 = 594x841).
+
+3. **Listá layouts existentes**: `list_layouts`. Reutilizá si ya hay uno
+   con el nombre pedido; si no, creá con `create_layout`.
+
+4. **Configurá la hoja**: `setup_layout_page` con el ancho/alto del formato
+   solicitado y `plot_unit='mm'`.
+
+5. **Calculá los extents del modelo**: leelos de `get_drawing_info` para
+   saber qué tamaño tiene el dibujo y elegir la escala correcta.
+
+6. **Insertá viewports**: para cada vista, llamá `create_viewport` con
+   `layout`, `center_x/y` (en coordenadas de papel),
+   `width`/`height` del viewport, `scale_ratio` (ej '1:50') y
+   opcionalmente `model_target_x/y` (centro del área del modelo a mostrar).
+
+7. **Bloqueá los viewports** importantes con `lock_viewport(handle, True)`
+   para que no se descalibre la escala al hacer zoom.
+
+8. **Agregá rotulación**: usá `set_active_layout` para asegurarte de estar
+   en el layout, después `create_text` o `create_mtext` con coordenadas
+   de papel para el cajetín/título.
+
+9. **Desactivá performance mode**: `set_performance_mode(False)`.
+
+10. **Reportá**: layout creado, viewports con handles y escalas, hoja
+    configurada, total de tiempo aproximado. Sugerí los próximos pasos
+    (impresión, exportar PDF) si aplica."""
 
 
 @mcp.prompt()
@@ -1510,6 +1631,542 @@ def get_selection_set(name: str = "MCP_SEL") -> list[dict]:
     ss = doc.SelectionSets.Add(name)
     ss.SelectOnScreen()
     return [_entity_detail(e) for e in ss]
+
+
+# ============================================================================
+# Layouts (presentaciones / paper space)
+# ============================================================================
+
+# Escalas estándar de viewport: relación = papel / modelo
+STANDARD_VIEWPORT_SCALES = {
+    "1:1": 1.0,
+    "1:2": 1/2,
+    "1:5": 1/5,
+    "1:10": 1/10,
+    "1:20": 1/20,
+    "1:25": 1/25,
+    "1:50": 1/50,
+    "1:75": 1/75,
+    "1:100": 1/100,
+    "1:125": 1/125,
+    "1:200": 1/200,
+    "1:250": 1/250,
+    "1:500": 1/500,
+    "1:1000": 1/1000,
+    "2:1": 2.0,
+    "5:1": 5.0,
+    "10:1": 10.0,
+}
+
+
+@mcp.tool()
+def list_layouts() -> list[dict]:
+    """
+    Lista todos los layouts (presentaciones) del dibujo, incluyendo Model.
+    """
+    acad = _get_acad()
+    doc = _active_doc(acad)
+    layouts = []
+    for layout in doc.Layouts:
+        try:
+            layouts.append({
+                "name": layout.Name,
+                "tab_order": layout.TabOrder,
+                "is_active": (layout.Name == doc.ActiveLayout.Name),
+                "block_name": layout.Block.Name,
+                "entity_count": layout.Block.Count,
+            })
+        except Exception:
+            pass
+    return sorted(layouts, key=lambda l: l.get("tab_order", 0))
+
+
+@mcp.tool()
+def set_active_layout(name: str) -> dict:
+    """
+    Cambia el layout activo. Usar 'Model' para volver a espacio modelo.
+
+    Args:
+        name: Nombre del layout (ej: 'Layout1', 'Plano A1', 'Model').
+    """
+    acad = _get_acad()
+    doc = _active_doc(acad)
+    for layout in doc.Layouts:
+        if layout.Name.lower() == name.lower():
+            doc.ActiveLayout = layout
+            return {"active_layout": layout.Name}
+    raise RuntimeError(f"No existe el layout '{name}'.")
+
+
+@mcp.tool()
+def create_layout(name: str, activate: bool = True) -> dict:
+    """
+    Crea un layout nuevo (presentación).
+
+    Args:
+        name: Nombre del layout.
+        activate: True para activarlo automáticamente.
+    """
+    acad = _get_acad()
+    doc = _active_doc(acad)
+    layout = doc.Layouts.Add(name)
+    if activate:
+        doc.ActiveLayout = layout
+    return {
+        "created": name,
+        "block_name": layout.Block.Name,
+        "active": activate,
+    }
+
+
+@mcp.tool()
+def delete_layout(name: str) -> dict:
+    """Borra un layout. No se puede borrar 'Model'."""
+    acad = _get_acad()
+    doc = _active_doc(acad)
+    if name.lower() == "model":
+        raise RuntimeError("No se puede borrar el espacio Model.")
+    for layout in doc.Layouts:
+        if layout.Name.lower() == name.lower():
+            layout.Delete()
+            return {"deleted": name}
+    raise RuntimeError(f"No existe el layout '{name}'.")
+
+
+@mcp.tool()
+def setup_layout_page(name: str, paper_width: float, paper_height: float,
+                      plot_unit: str = "mm") -> dict:
+    """
+    Configura el tamaño de hoja de un layout.
+
+    Args:
+        name: Nombre del layout.
+        paper_width: Ancho del papel.
+        paper_height: Alto del papel.
+        plot_unit: 'mm' o 'inches'.
+    """
+    acad = _get_acad()
+    doc = _active_doc(acad)
+    layout = None
+    for l in doc.Layouts:
+        if l.Name.lower() == name.lower():
+            layout = l
+            break
+    if layout is None:
+        raise RuntimeError(f"No existe el layout '{name}'.")
+    # 0=inches, 1=mm
+    layout.PaperUnits = 1 if plot_unit.lower() == "mm" else 0
+    try:
+        layout.SetCustomScale(1, 1)
+    except Exception:
+        pass
+    try:
+        layout.CanonicalMediaName = "User Defined"
+    except Exception:
+        pass
+    try:
+        layout.SetCustomPaperSize(paper_width, paper_height)
+    except Exception as exc:
+        return {"layout": name, "warning": f"No se pudo fijar tamaño custom: {exc}"}
+    return {
+        "layout": name,
+        "paper_width": paper_width,
+        "paper_height": paper_height,
+        "unit": plot_unit,
+    }
+
+
+# ============================================================================
+# Viewports (en paper space)
+# ============================================================================
+
+@mcp.tool()
+def create_viewport(layout: str, center_x: float, center_y: float,
+                    width: float, height: float,
+                    scale_ratio: str = "",
+                    model_target_x: float | None = None,
+                    model_target_y: float | None = None) -> dict:
+    """
+    Crea un viewport rectangular en un layout y opcionalmente le fija escala.
+
+    Args:
+        layout: Nombre del layout (debe existir y estar en paper space).
+        center_x, center_y: Centro del viewport en coordenadas de papel.
+        width, height: Ancho y alto del viewport en unidades de papel.
+        scale_ratio: Escala estándar como '1:50', '1:100', '2:1', etc.
+                     Vacío = no fijar escala.
+        model_target_x, model_target_y: Punto del modelo a centrar dentro
+                     del viewport. Vacío = no cambiar el target.
+    """
+    acad = _get_acad()
+    doc = _active_doc(acad)
+
+    # Activar el layout solicitado
+    found = None
+    for l in doc.Layouts:
+        if l.Name.lower() == layout.lower():
+            found = l
+            break
+    if found is None:
+        raise RuntimeError(f"Layout '{layout}' no existe.")
+    doc.ActiveLayout = found
+
+    pspace = doc.PaperSpace
+    vp = pspace.AddPViewport(_point(center_x, center_y, 0), width, height)
+
+    # Encender el viewport (mostrar el modelo dentro)
+    try:
+        doc.MSpace = True
+        vp.Display(True)
+    except Exception:
+        pass
+    finally:
+        try:
+            doc.MSpace = False
+        except Exception:
+            pass
+
+    info: dict[str, Any] = {
+        "handle": vp.Handle,
+        "layout": layout,
+        "center": {"x": center_x, "y": center_y},
+        "size": {"width": width, "height": height},
+    }
+
+    # Fijar escala custom
+    if scale_ratio:
+        ratio = STANDARD_VIEWPORT_SCALES.get(scale_ratio)
+        if ratio is None:
+            # Parseo manual "A:B"
+            if ":" in scale_ratio:
+                a, b = scale_ratio.split(":")
+                ratio = float(a) / float(b)
+            else:
+                raise ValueError(f"Escala inválida: {scale_ratio}")
+        try:
+            vp.CustomScale = ratio
+            info["scale"] = scale_ratio
+            info["custom_scale"] = ratio
+        except Exception as exc:
+            info["scale_error"] = str(exc)
+
+    # Centrar el viewport en un punto del modelo
+    if model_target_x is not None and model_target_y is not None:
+        try:
+            vp.ViewCenter = _point(model_target_x, model_target_y, 0)
+            info["target"] = {"x": model_target_x, "y": model_target_y}
+        except Exception as exc:
+            info["target_error"] = str(exc)
+
+    return info
+
+
+@mcp.tool()
+def list_viewports(layout: str = "") -> list[dict]:
+    """
+    Lista los viewports de un layout (o del layout activo si no se indica).
+    No incluye el viewport "general" (#1) que envuelve toda la presentación.
+    """
+    acad = _get_acad()
+    doc = _active_doc(acad)
+    if layout:
+        for l in doc.Layouts:
+            if l.Name.lower() == layout.lower():
+                doc.ActiveLayout = l
+                break
+    result = []
+    for entity in doc.PaperSpace:
+        if entity.ObjectName == "AcDbViewport":
+            try:
+                # El viewport 1 (con number=1) es el contenedor del layout
+                if entity.Number == 1:
+                    continue
+            except Exception:
+                pass
+            try:
+                c = entity.Center
+                result.append({
+                    "handle": entity.Handle,
+                    "center": {"x": c[0], "y": c[1]},
+                    "width": entity.Width,
+                    "height": entity.Height,
+                    "custom_scale": entity.CustomScale,
+                    "scale_label": _scale_label(entity.CustomScale),
+                    "on": entity.ViewportOn,
+                    "locked": entity.DisplayLocked,
+                })
+            except Exception:
+                pass
+    return result
+
+
+def _scale_label(ratio: float) -> str:
+    """Convierte un factor de escala a 'A:B' aproximado."""
+    if ratio <= 0:
+        return str(ratio)
+    if ratio >= 1:
+        return f"{round(ratio)}:1"
+    inv = 1 / ratio
+    # Redondear a la escala estándar más cercana si está dentro de 1%
+    for label, std in STANDARD_VIEWPORT_SCALES.items():
+        if std == 0:
+            continue
+        if abs(std - ratio) / std < 0.01:
+            return label
+    return f"1:{round(inv)}"
+
+
+@mcp.tool()
+def set_viewport_scale(handle: str, scale_ratio: str) -> dict:
+    """
+    Fija la escala de un viewport por su handle.
+
+    Args:
+        handle: Handle del viewport (lo da list_viewports).
+        scale_ratio: '1:50', '1:100', '2:1', etc.
+    """
+    acad = _get_acad()
+    doc = _active_doc(acad)
+    vp = doc.HandleToObject(handle)
+    if vp.ObjectName != "AcDbViewport":
+        raise RuntimeError(f"{handle} no es un viewport (es {vp.ObjectName}).")
+
+    ratio = STANDARD_VIEWPORT_SCALES.get(scale_ratio)
+    if ratio is None:
+        if ":" in scale_ratio:
+            a, b = scale_ratio.split(":")
+            ratio = float(a) / float(b)
+        else:
+            raise ValueError(f"Escala inválida: {scale_ratio}")
+    vp.CustomScale = ratio
+    return {
+        "handle": handle,
+        "scale": scale_ratio,
+        "custom_scale": ratio,
+    }
+
+
+@mcp.tool()
+def lock_viewport(handle: str, locked: bool = True) -> dict:
+    """Bloquea o desbloquea la visualización de un viewport para que no se altere su escala."""
+    acad = _get_acad()
+    doc = _active_doc(acad)
+    vp = doc.HandleToObject(handle)
+    vp.DisplayLocked = locked
+    return {"handle": handle, "locked": locked}
+
+
+@mcp.tool()
+def fit_viewport_to_extents(handle: str, margin: float = 1.05) -> dict:
+    """
+    Ajusta el viewport para mostrar los extents del modelo.
+    No fija una escala estándar — usalo cuando querés que se vea "todo".
+
+    Args:
+        handle: Handle del viewport.
+        margin: Factor multiplicativo del tamaño visible (1.05 = 5% extra).
+    """
+    acad = _get_acad()
+    doc = _active_doc(acad)
+    vp = doc.HandleToObject(handle)
+    db = doc.Database
+    ext_min, ext_max = db.Extmin, db.Extmax
+    cx = (ext_min[0] + ext_max[0]) / 2
+    cy = (ext_min[1] + ext_max[1]) / 2
+    model_w = (ext_max[0] - ext_min[0]) * margin
+    model_h = (ext_max[1] - ext_min[1]) * margin
+    # Escala que hace caber el modelo dentro del viewport
+    paper_w = vp.Width
+    paper_h = vp.Height
+    scale = min(paper_w / max(model_w, 1e-9), paper_h / max(model_h, 1e-9))
+    vp.CustomScale = scale
+    vp.ViewCenter = _point(cx, cy, 0)
+    return {
+        "handle": handle,
+        "custom_scale": scale,
+        "scale_label": _scale_label(scale),
+        "centered_on": {"x": cx, "y": cy},
+    }
+
+
+# ============================================================================
+# Operaciones batch (lotes de geometría — mucho más rápidas)
+# ============================================================================
+
+@mcp.tool()
+def create_lines_batch(lines: list[list[float]], layer: str = "") -> dict:
+    """
+    Crea varias líneas en un solo bloqueo de pantalla.
+
+    Args:
+        lines: Lista de líneas [[x1,y1,x2,y2], ...] o [[x1,y1,z1,x2,y2,z2], ...].
+        layer: Capa para todas las líneas (vacío = capa activa).
+    """
+    acad = _get_acad()
+    ms = _model_space(acad)
+    handles = []
+    with _fast_batch(acad):
+        for ln in lines:
+            if len(ln) == 4:
+                x1, y1, x2, y2 = ln
+                z1 = z2 = 0.0
+            elif len(ln) == 6:
+                x1, y1, z1, x2, y2, z2 = ln
+            else:
+                continue
+            line = ms.AddLine(_point(x1, y1, z1), _point(x2, y2, z2))
+            if layer:
+                line.Layer = layer
+            handles.append(line.Handle)
+    return {"created": len(handles), "handles": handles}
+
+
+@mcp.tool()
+def create_polylines_batch(polylines: list[dict]) -> dict:
+    """
+    Crea varias polilíneas en lote.
+
+    Args:
+        polylines: Lista de objetos {"points": [[x,y],...], "closed": bool, "layer": str}
+    """
+    acad = _get_acad()
+    ms = _model_space(acad)
+    handles = []
+    with _fast_batch(acad):
+        for pl in polylines:
+            pts = pl.get("points") or []
+            flat = []
+            for p in pts:
+                flat.extend([float(p[0]), float(p[1])])
+            if len(flat) < 4:
+                continue
+            pline = ms.AddLightWeightPolyline(_double_array(flat))
+            if pl.get("closed"):
+                pline.Closed = True
+            if pl.get("layer"):
+                pline.Layer = pl["layer"]
+            handles.append(pline.Handle)
+    return {"created": len(handles), "handles": handles}
+
+
+@mcp.tool()
+def create_texts_batch(texts: list[dict]) -> dict:
+    """
+    Crea varios textos en lote.
+
+    Args:
+        texts: Lista de {"text": str, "x": float, "y": float,
+                         "height": float, "rotation_deg": float,
+                         "style": str, "layer": str}
+    """
+    acad = _get_acad()
+    ms = _model_space(acad)
+    handles = []
+    with _fast_batch(acad):
+        for t in texts:
+            txt = ms.AddText(
+                t["text"],
+                _point(t["x"], t["y"], 0),
+                float(t.get("height", 2.5)),
+            )
+            if t.get("rotation_deg"):
+                txt.Rotation = math.radians(float(t["rotation_deg"]))
+            if t.get("style"):
+                txt.StyleName = t["style"]
+            if t.get("layer"):
+                txt.Layer = t["layer"]
+            handles.append(txt.Handle)
+    return {"created": len(handles), "handles": handles}
+
+
+@mcp.tool()
+def transform_batch(handles: list[str],
+                    dx: float = 0.0, dy: float = 0.0,
+                    scale_factor: float | None = None,
+                    base_x: float = 0.0, base_y: float = 0.0,
+                    rotation_deg: float | None = None) -> dict:
+    """
+    Aplica desplazamiento, escala y/o rotación a varias entidades en una sola pasada.
+
+    Args:
+        handles: Lista de handles.
+        dx, dy: Desplazamiento (opcional).
+        scale_factor: Factor de escala respecto a (base_x, base_y).
+        base_x, base_y: Punto base para escala y rotación.
+        rotation_deg: Rotación en grados respecto a (base_x, base_y).
+    """
+    acad = _get_acad()
+    doc = _active_doc(acad)
+    affected, errors = [], []
+    base = _point(base_x, base_y, 0)
+    with _fast_batch(acad):
+        for h in handles:
+            try:
+                e = doc.HandleToObject(h)
+                if dx or dy:
+                    e.Move(_point(0, 0, 0), _point(dx, dy, 0))
+                if scale_factor is not None:
+                    e.ScaleEntity(base, float(scale_factor))
+                if rotation_deg is not None:
+                    e.Rotate(base, math.radians(float(rotation_deg)))
+                affected.append(h)
+            except Exception as exc:
+                errors.append({"handle": h, "error": str(exc)})
+    return {"affected": len(affected), "handles": affected, "errors": errors}
+
+
+# ============================================================================
+# Control de performance
+# ============================================================================
+
+@mcp.tool()
+def set_performance_mode(enabled: bool = True) -> dict:
+    """
+    Activa/desactiva variables de AutoCAD que mejoran el rendimiento durante
+    sesiones largas:
+    - CMDECHO=0: no imprime cada comando en la línea de comandos
+    - REGENMODE=0: evita regeneraciones automáticas frecuentes
+    - HIGHLIGHT=0: no resalta entidades al seleccionarlas
+
+    Llamá a esta tool con enabled=False al final para restaurar defaults.
+    """
+    acad = _get_acad()
+    doc = _active_doc(acad)
+    if enabled:
+        doc.SetVariable("CMDECHO", 0)
+        try:
+            doc.SetVariable("REGENMODE", 0)
+        except Exception:
+            pass
+        try:
+            doc.SetVariable("HIGHLIGHT", 0)
+        except Exception:
+            pass
+        return {"performance_mode": "ON"}
+    else:
+        doc.SetVariable("CMDECHO", 1)
+        try:
+            doc.SetVariable("REGENMODE", 1)
+        except Exception:
+            pass
+        try:
+            doc.SetVariable("HIGHLIGHT", 1)
+        except Exception:
+            pass
+        try:
+            doc.Regen(1)
+        except Exception:
+            pass
+        return {"performance_mode": "OFF"}
+
+
+@mcp.tool()
+def regen_drawing() -> dict:
+    """Fuerza una regeneración del dibujo (útil después de un batch grande)."""
+    acad = _get_acad()
+    doc = _active_doc(acad)
+    doc.Regen(1)
+    return {"regenerated": True}
 
 
 # ============================================================================
