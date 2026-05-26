@@ -19,23 +19,27 @@ Funciona en **Windows** con AutoCAD instalado.
 ```bash
 git clone https://github.com/juanchiferes/claude-cad.git
 cd claude-cad
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## Configurar Claude Code
+## Configurar Claude Desktop
 
-Edita `%APPDATA%\Claude\claude_desktop_config.json` (o `~/.claude.json`):
+Edita `%APPDATA%\Claude\claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "autocad": {
-      "command": "python",
-      "args": ["C:\\ruta\\a\\claude-cad\\server.py"]
+      "command": "C:\\Users\\Usuario\\claude-cad\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\Users\\Usuario\\claude-cad\\server.py"]
     }
   }
 }
 ```
+
+> Reemplazá `Usuario` con tu nombre de usuario de Windows.
 
 ## Uso
 
